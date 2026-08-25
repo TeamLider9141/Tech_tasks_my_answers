@@ -2,7 +2,7 @@
 
 ## 1. Which AI tools did you use?
 
-Claude Code (Anthropic's CLI agent, Claude Fable 5 model).
+Claude Code.
 
 ## 2. What tasks did you ask them to perform?
 
