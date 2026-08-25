@@ -130,6 +130,10 @@ Tables (`migrations/0001_init.sql`):
   request_hash, created_at, expires_at
 - `reservation_items` — reservation_id, product_id, quantity (`CHECK > 0`)
 
+How the tables connect:
+
+![Database ERD](<./Inventory Reservation Service — Database ERD.jpg>)
+
 **Reserved quantity is calculated, not stored.** `stock.quantity` is only
 physical stock; reserved is a SUM over active reservations. I considered a
 `reserved` column first, but it has to be updated in 4 places (create,
