@@ -1,41 +1,41 @@
 # Inventory Reservation Service
 
-A small HTTP service for reserving products while a customer completes
-checkout. Go + PostgreSQL, no framework: the standard library `net/http`
-router (Go 1.22+ patterns) and the `pgx` driver are the only meaningful
-dependencies.
+Small HTTP service that reserves products while a customer is going through
+checkout. Written in Go with PostgreSQL. No framework: only the standard
+library `net/http` router (Go 1.22+ patterns) and the `pgx` driver.
 
 ## Requirements
 
 - Go 1.24+
 - Docker + Docker Compose (for PostgreSQL), or any PostgreSQL 14+ instance
 
-## Setup and run
+## How to run
 
 ```bash
-# 1. Start PostgreSQL (listens on localhost:5434 to avoid clashing with a
-#    locally installed PostgreSQL on 5432)
+# 1. Start PostgreSQL (on port 5434, so it won't conflict with a local
+#    postgres already running on 5432)
 make db-up
 
 # 2. Run the service (applies migrations automatically at startup)
 make run
 ```
 
-The server listens on `:8080` by default. Configuration is environment-based:
+The server listens on `:8080`. Configuration comes from env variables:
 
 | Variable       | Default                                                            |
 |----------------|--------------------------------------------------------------------|
 | `DATABASE_URL` | `postgres://inventory:inventory@localhost:5434/inventory?sslmode=disable` |
 | `ADDR`         | `:8080`                                                            |
 
-Migrations are plain SQL files in `migrations/`, embedded into the binary and
-applied at startup by a small runner (tracked in `schema_migrations`, guarded
-by an advisory lock so multiple instances can boot concurrently). No external
-migration tool is required.
+Migrations are plain SQL files in `migrations/`, embedded into the binary.
+A small runner applies them at startup and records them in the
+`schema_migrations` table. It takes an advisory lock first, so two instances
+starting at the same time won't apply the same migration twice. No external
+migration tool is needed.
 
 ## Tests
 
-Tests run against a **real PostgreSQL database** (`inventory_test`, created
+Tests run against a real PostgreSQL database (`inventory_test`, created
 automatically by the compose init script):
 
 ```bash
@@ -43,42 +43,43 @@ make db-up   # once
 make test
 ```
 
-To point tests elsewhere set `TEST_DATABASE_URL`. The suite truncates all
-tables before each test, so never point it at a database you care about.
+You can set `TEST_DATABASE_URL` to point somewhere else. The tests truncate
+all tables before every test, so don't point it at a database with real data.
 
-The tests are integration tests at the HTTP handler level: they exercise
-routing, validation, transaction logic and error mapping in one pass, and
-they cover every behaviour required by the assignment (atomic multi-item
-reservation, all-or-nothing failure, confirm, cancel + release, expired
-confirm rejection, idempotent replay, concurrent competition for insufficient
-stock, invalid input and invalid transitions).
+I went with integration tests at the HTTP level instead of unit tests with
+mocks. The risky logic here is SQL and transaction boundaries, and mocks
+can't catch mistakes there. The suite covers everything the assignment asks
+for: multi-item reservation, all-or-nothing failure, confirm, cancel and
+release, rejecting confirm on an expired reservation, idempotent replay,
+concurrent requests competing for the last stock, and validation errors.
 
 ## API
 
 All request and response bodies are JSON. Timestamps are UTC (RFC 3339).
 
-Errors share one shape:
+All errors have the same shape:
 
 ```json
 {"error": {"code": "insufficient_stock", "message": "...", "shortages": [...]}}
 ```
 
-| Code                       | HTTP | Meaning                                        |
-|----------------------------|------|------------------------------------------------|
-| `invalid_request`          | 400  | Malformed JSON, missing/out-of-range fields    |
-| `invalid_quantity`         | 400  | Quantity not a positive integer                |
-| `not_found`                | 404  | Unknown warehouse / product / reservation      |
-| `already_exists`           | 409  | Product/warehouse name taken                   |
-| `insufficient_stock`       | 409  | Reservation rejected; `shortages` lists detail |
-| `invalid_state`            | 409  | Transition not allowed from current status     |
-| `reservation_expired`      | 409  | Confirm attempted on an expired reservation    |
-| `idempotency_key_conflict` | 409  | Key reused with a different payload            |
-| `internal_error`           | 500  | Unexpected failure                             |
+| Code                       | HTTP | Meaning                                      |
+|----------------------------|------|----------------------------------------------|
+| `invalid_request`          | 400  | Bad JSON or missing/wrong fields             |
+| `invalid_quantity`         | 400  | Quantity is not a positive integer           |
+| `not_found`                | 404  | Warehouse, product or reservation not found  |
+| `already_exists`           | 409  | Product/warehouse name already taken         |
+| `insufficient_stock`       | 409  | Not enough stock; `shortages` has details    |
+| `invalid_state`            | 409  | Action not allowed in the current status     |
+| `reservation_expired`      | 409  | Confirm attempted on an expired reservation  |
+| `idempotency_key_conflict` | 409  | Same key reused with a different body        |
+| `internal_error`           | 500  | Unexpected error                             |
 
-### Convenience endpoints
+### Products and warehouses
 
-Not part of the required surface, but without them the service cannot be
-exercised end-to-end without hand-written SQL:
+The assignment doesn't ask for these endpoints, but without them you can't
+try the service end to end without writing SQL by hand, so I added minimal
+ones:
 
 ```bash
 curl -X POST localhost:8080/products   -d '{"name":"laptop"}'
@@ -99,12 +100,13 @@ curl localhost:8080/warehouses/1/products/1/stock
 # → 200 {"warehouse_id":1,"product_id":1,"physical":10,"reserved":4,"available":6}
 ```
 
-`available = physical − quantity held by active, non-expired reservations`.
+`available = physical - reserved`, where reserved is the total quantity held
+by active reservations that haven't expired yet.
 
 ### Reservations
 
-Creation requires an **`Idempotency-Key` header** (1–200 chars, chosen by the
-client, e.g. a UUID per checkout attempt):
+Creating a reservation requires an `Idempotency-Key` header (1–200 chars,
+chosen by the client, for example a UUID per checkout attempt):
 
 ```bash
 curl -X POST localhost:8080/reservations \
@@ -112,11 +114,14 @@ curl -X POST localhost:8080/reservations \
   -d '{"warehouse_id":1,"items":[{"product_id":1,"quantity":4}]}'
 ```
 
-`201` with the reservation on first creation; `200` with the **original**
-reservation when the same key is replayed with the same payload; `409` when
-the key is reused with a different payload. A reservation reserves every
-item or nothing: if any product lacks stock the whole request fails with
-`insufficient_stock` and a `shortages` list.
+- First request: `201` with the new reservation.
+- Same key with the same body again: `200` with the original reservation,
+  nothing new is created.
+- Same key with a different body: `409 idempotency_key_conflict`.
+
+A reservation is all-or-nothing: if any product doesn't have enough stock,
+nothing is reserved and the response is `insufficient_stock` with a
+`shortages` list showing what was missing.
 
 ```json
 {
@@ -146,166 +151,133 @@ curl -X POST localhost:8080/reservations/{id}/cancel
             └──────────► expired     (terminal; hold released)
 ```
 
-- Repeating `confirm` on a confirmed reservation (or `cancel` on a cancelled
-  one) returns `200` and changes nothing — safe client retries.
-- Any other transition (confirm a cancelled/expired reservation, cancel a
-  confirmed/expired one) returns `409` with the current status in the body,
-  so a client that lost track of state learns the truth from the error.
-- Confirming deducts physical stock in the same transaction that finalizes
-  the reservation, so availability is continuous: before confirm the goods
-  are held by the reservation, after confirm they are gone from physical.
+- `confirm` on an already confirmed reservation (or `cancel` on a cancelled
+  one) returns `200` and changes nothing, so client retries are safe.
+- Any other wrong transition (for example confirming a cancelled
+  reservation) returns `409` with the current status in the body.
+- `confirm` subtracts the physical stock in the same transaction that
+  finalizes the reservation.
 
-## Database and transaction design
+## Database design
 
-Schema (`migrations/0001_init.sql`):
+Tables (see `migrations/0001_init.sql`):
 
-```mermaid
-erDiagram
-    warehouses ||--o{ stock : holds
-    products ||--o{ stock : "stocked as"
-    warehouses ||--o{ reservations : receives
-    reservations ||--o{ reservation_items : contains
-    products ||--o{ reservation_items : reserves
+- `products` — id, unique name
+- `warehouses` — id, unique name
+- `stock` — one row per (warehouse, product): physical quantity,
+  `CHECK (quantity >= 0)`
+- `reservations` — uuid id, warehouse_id, status
+  (`active | confirmed | cancelled | expired`), unique `idempotency_key`,
+  `request_hash`, `created_at`, `expires_at`, `finalized_at`
+- `reservation_items` — (reservation_id, product_id, quantity),
+  `CHECK (quantity > 0)`
 
-    products {
-        bigint id PK
-        text name UK
-        timestamptz created_at
-    }
-    warehouses {
-        bigint id PK
-        text name UK
-        timestamptz created_at
-    }
-    stock {
-        bigint warehouse_id PK, FK
-        bigint product_id PK, FK
-        bigint quantity "CHECK quantity >= 0"
-        timestamptz updated_at
-    }
-    reservations {
-        uuid id PK
-        bigint warehouse_id FK
-        reservation_status status "active | confirmed | cancelled | expired"
-        text idempotency_key UK
-        text request_hash
-        timestamptz created_at
-        timestamptz expires_at
-        timestamptz finalized_at "null until confirmed/cancelled"
-    }
-    reservation_items {
-        uuid reservation_id PK, FK
-        bigint product_id PK, FK
-        bigint quantity "CHECK quantity > 0"
-    }
-```
+### Why availability is computed, not stored
 
-**Availability is computed, not stored.** `stock.quantity` holds physical
-stock only; reserved quantity is `SUM(items of active reservations whose
-expires_at > now())`. The alternative — a `reserved` counter on the stock
-row — is faster to read but must be mutated in perfect lockstep on create,
-cancel, confirm *and* expiry, and drifts permanently if any path misses.
-With the computed form, cancel is a status flip and expiry needs **no write
-at all** to be correct.
+`stock.quantity` holds only physical stock. Reserved quantity is a `SUM`
+over the items of active reservations that haven't expired. I also
+considered a `reserved` counter column on `stock` — reads would be faster —
+but that counter has to be updated correctly in four places (create, cancel,
+confirm, expire), and if any one of them misses, the number drifts and the
+error stays forever. With the computed version, cancel is just a status
+change, and expiry doesn't need any write at all to be correct.
 
-**No oversell under concurrency.** Reservation creation runs in one
-transaction that:
+### How oversell is prevented
 
-1. locks the stock rows of the requested products with
-   `SELECT … FOR UPDATE` in `product_id` order (deterministic order →
-   no deadlocks between multi-item reservations);
-2. computes reserved sums and checks `requested ≤ physical − reserved`
-   for every item;
-3. inserts the reservation and its items, or aborts entirely.
+Creating a reservation is one transaction:
 
-Competing requests for the same product serialize on the row lock —
-across goroutines and across service instances, because the lock lives in
-PostgreSQL. Plain `READ COMMITTED` suffices; there is no in-process mutex.
-`CHECK` constraints (`quantity >= 0`, item `quantity > 0`) back the
-application logic at the database layer.
+1. `SELECT ... FOR UPDATE` on the stock rows of the requested products,
+   always ordered by `product_id`. Same order everywhere means two
+   multi-item reservations can't deadlock each other.
+2. Compute the reserved sums and check `requested <= physical - reserved`
+   for every item.
+3. Insert the reservation and its items, or roll back everything.
 
-**Confirm** locks the reservation row `FOR UPDATE`, then decrements the
-stock rows (same sorted order) and flips the status in one transaction.
-A `CHECK` violation here is impossible by invariant: every active
-reservation was admitted against `physical − reserved ≥ 0`.
+Two concurrent requests for the same product line up on the row lock, so the
+second one always sees the result of the first. The lock lives in
+PostgreSQL, so it also works when several instances of the service run at
+once — no in-process mutex, and normal `READ COMMITTED` is enough. The
+`CHECK` constraints protect the same rules on the database level as a second
+line of defense.
 
-**Idempotent creation.** `reservations.idempotency_key` is `UNIQUE`; a
-SHA-256 hash of the semantic payload (warehouse + sorted items) is stored
-next to it. Replay returns the stored reservation; a different payload under
-the same key is rejected. If two requests with the same fresh key race, the
-loser hits the unique index, re-reads the winner's row and returns it — the
-database, not the application, arbitrates.
+`confirm` locks the reservation row with `FOR UPDATE`, subtracts the stock
+rows (same sorted order) and sets the status, all in one transaction.
 
-**Time.** All timestamps are `timestamptz` written with `now()` — the
-database clock is the single source of truth, so multiple app instances with
-skewed clocks cannot disagree about expiry. Expiration is **lazy**: the
-availability query simply ignores active reservations past `expires_at`, and
-endpoints that touch a reservation materialize `active → expired` when the
-deadline has passed. No background worker is needed for correctness.
+### Idempotency
+
+`reservations.idempotency_key` is `UNIQUE`. Next to it I store a SHA-256
+hash of the meaningful part of the request (warehouse + sorted items), so a
+retry with the same JSON in a different key order still counts as the same
+request. Replay returns the stored reservation; the same key with a
+different payload is rejected. If two requests race with the same fresh key,
+the loser hits the unique index, then reads the winner's reservation and
+returns that.
+
+### Time and expiry
+
+All timestamps are `timestamptz` written with the database `now()`, so
+several app instances with different clocks can't disagree about expiry.
+Expiry is lazy: the availability query just ignores active reservations
+whose `expires_at` is in the past, and endpoints that touch such a
+reservation update its status to `expired`. No background worker is needed
+for correctness.
 
 ## Assumptions
 
-- A reservation is scoped to **one warehouse** (per the assignment's
-  "products from one warehouse").
-- Confirming a reservation **deducts physical stock** — the sale is final
-  and goods leave the sellable pool. If confirm should instead hand off to a
-  separate fulfilment step, only the confirm branch changes.
-- Stock can only be **added**; decrements happen exclusively through
-  confirmed reservations. Corrections/write-offs are out of scope.
-- Product and warehouse management is out of scope; minimal create
-  endpoints exist purely to make the service testable end-to-end.
-- An expired reservation is terminal: it can be neither confirmed (required)
-  nor cancelled (design choice — the client learns the real state from the
-  409 instead of a misleading success).
-- Quantities are integers, capped at 10⁹ per request to stay far from
-  `bigint` overflow.
+- One reservation belongs to one warehouse (the assignment says "products
+  from one warehouse").
+- `confirm` means the sale is final: physical stock is subtracted. If it
+  should instead hand off to a separate fulfillment step, only the confirm
+  branch changes.
+- Stock can only be added through the API; it only goes down through
+  confirmed reservations. Corrections and write-offs are out of scope.
+- Product and warehouse management is out of scope; the minimal create
+  endpoints exist only to make the service testable end to end.
+- An expired reservation is terminal: it can't be confirmed (required by
+  the task) and also can't be cancelled (my choice — the 409 tells the
+  client the real state instead of a misleading success).
+- Quantities are integers, max 10^9 per request, to stay far away from
+  bigint overflow.
 
-## Important tradeoffs
+## Tradeoffs
 
-- **Computed availability** trades read-time work (an aggregate over active
-  reservations per stock read) for write-time simplicity and immunity to
-  counter drift. At this scale the aggregate is a cheap indexed lookup; a
-  high-traffic system might maintain a counter and reconcile.
-- **Row locks over `SERIALIZABLE`**: explicit `FOR UPDATE` locks make the
-  serialization point visible and avoid retry loops that `SERIALIZABLE`
-  failures would force on every client path.
-- **Integration tests over unit tests with mocks**: the risky logic lives in
-  SQL and transaction boundaries, which mocks cannot exercise. Fewer,
-  behaviour-level tests against real PostgreSQL cover more of what can
-  actually break.
-- **Handler-computed request hash** (semantic: warehouse + sorted items)
-  rather than raw-body hash, so a retried request with different JSON key
-  order or whitespace still counts as the same request.
+- **Computed availability**: every stock read does an aggregate over active
+  reservations. At this scale it's a cheap indexed query. A very
+  high-traffic system would probably keep a counter and reconcile it
+  periodically.
+- **`FOR UPDATE` row locks instead of `SERIALIZABLE`**: the locking point
+  is explicit and visible, and clients don't need retry loops for
+  serialization failures.
+- **Integration tests instead of mocked unit tests**: fewer tests, but they
+  test the real behavior against a real database.
+- **Request hash from parsed fields** (warehouse + sorted items), not from
+  the raw body, so formatting differences in a retry don't break
+  idempotency.
 
 ## Known limitations
 
-- Idempotency keys live forever (one row each) and are global, not
-  per-client — two clients choosing the same key would collide. Namespacing
-  by authenticated client would fix this once auth exists; keys should also
-  be purged after a retention window.
-- Idempotency covers reservation **creation** only. Confirm/cancel are
-  naturally idempotent through the state machine, but a *failed* create
-  (e.g. insufficient stock) is not recorded, so a retry re-executes the
-  check — correct, but the client may see a different error than the
-  original attempt.
-- Expired reservations are materialized lazily, so `status` in the database
-  may read `active` for a reservation that is already dead until something
-  touches it. All correctness-relevant queries account for this; an
-  operational report over raw tables must repeat the `expires_at` filter.
-- No pagination/listing endpoints, no metrics, no structured request
+- Idempotency keys are global and live forever. Two different clients
+  picking the same key would collide. With auth, keys should be scoped per
+  client and cleaned up after some retention period.
+- Idempotency only covers creation. A failed create (insufficient stock) is
+  not recorded, so a retry runs the check again — still correct, but the
+  client may see a different error than the first time.
+- Because expiry is lazy, `status` in the database can still say `active`
+  for an already-expired reservation until something touches it. The
+  queries in the service account for this, but a manual report over the raw
+  tables has to repeat the `expires_at` filter.
+- No pagination or listing endpoints, no metrics, no structured request
   logging, no rate limiting.
-- The stock lock serializes all reservations touching the same product in a
-  warehouse; a very hot product becomes a contention point.
+- All reservations for the same product in a warehouse serialize on one row
+  lock, so a very hot product becomes a bottleneck.
 
 ## What I would improve with more time
 
-- A tiny background sweeper to materialize expired reservations in batches,
-  keeping reporting queries honest without changing correctness.
-- Per-client idempotency scope + key TTL/cleanup.
-- Structured request logging middleware, request IDs, and Prometheus
-  metrics (reservation outcomes, lock wait times).
-- CI (GitHub Actions: compose PostgreSQL service + `go test -race`).
-- Property-style concurrency tests (random interleavings of
-  create/confirm/cancel/expire under load, asserting the availability
-  invariant after every round).
-- API pagination for reservations and stock listings.
+- A small background job that marks expired reservations in batches, so
+  reports over raw tables get cleaner (correctness doesn't change).
+- Per-client idempotency keys with a TTL and cleanup.
+- Request logging middleware, request IDs, Prometheus metrics.
+- CI with GitHub Actions (PostgreSQL service container + `go test -race`).
+- A stress test with random create/confirm/cancel/expire interleavings,
+  checking the availability invariant after every round.
+- Pagination for reservations and stock listings.
