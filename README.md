@@ -132,7 +132,46 @@ Tables (`migrations/0001_init.sql`):
 
 How the tables connect:
 
-![Database ERD](<./Inventory Reservation Service — Database ERD.jpg>)
+```mermaid
+erDiagram
+    warehouses ||--o{ stock : holds
+    products ||--o{ stock : "stocked as"
+    warehouses ||--o{ reservations : receives
+    reservations ||--o{ reservation_items : contains
+    products ||--o{ reservation_items : reserves
+
+    products {
+        bigint id PK
+        text name UK
+        timestamptz created_at
+    }
+    warehouses {
+        bigint id PK
+        text name UK
+        timestamptz created_at
+    }
+    stock {
+        bigint warehouse_id PK, FK
+        bigint product_id PK, FK
+        bigint quantity "CHECK quantity >= 0"
+        timestamptz updated_at
+    }
+    reservations {
+        uuid id PK
+        bigint warehouse_id FK
+        reservation_status status "active | confirmed | cancelled | expired"
+        text idempotency_key UK
+        text request_hash
+        timestamptz created_at
+        timestamptz expires_at
+        timestamptz finalized_at "null until confirmed/cancelled"
+    }
+    reservation_items {
+        uuid reservation_id PK, FK
+        bigint product_id PK, FK
+        bigint quantity "CHECK quantity > 0"
+    }
+```
 
 **Reserved quantity is calculated, not stored.** `stock.quantity` is only
 physical stock; reserved is a SUM over active reservations. I considered a
