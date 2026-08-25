@@ -6,50 +6,38 @@ Claude Code.
 
 ## 2. What tasks did you ask them to perform?
 
-- Talking through the storage design before writing code: store a `reserved`
-  counter or compute the reserved quantity from reservations, and which
-  locking approach to use.
-- Generating the first version of the code: the migration, the store layer
-  with the transactions, the HTTP handlers, and the integration tests.
-- First drafts of the documentation (README, REVIEW.md), which I then
-  reviewed and edited.
-- Small environment things: the docker-compose file, the Makefile, fixing
-  port conflicts.
+- Discussing the design before coding: store a `reserved` counter or
+  calculate it, and which locking approach to use.
+- Generating the first version of the code: migration, store layer,
+  handlers, tests.
+- First drafts of README and REVIEW.md, which I reviewed and edited after.
+- docker-compose, Makefile, fixing port conflicts.
 
 ## 3. What is one AI suggestion you rejected, and why?
 
-The first design kept a `reserved` counter column on the `stock` table,
-updated on every create/cancel/confirm/expire. I rejected it and compute the
-reserved quantity from active reservations instead. The counter has to be
-updated correctly in four different places, and if one of them misses, the
-number drifts and stays wrong. Expiry is the worst case: with a counter it
-needs a stock write exactly at a moment when nothing else touches the row.
-With the computed version, expiry needs no write at all.
+The first design had a `reserved` counter column in the `stock` table,
+updated on every create/cancel/confirm/expire. I rejected it because the
+counter must be updated in four different places, and if one is missed the
+number goes wrong and stays wrong. Calculating reserved from active
+reservations is safer — expire then needs no update at all.
 
 ## 4. What generated code did you substantially change or simplify?
 
 - The generated handlers had a broken shared helper for the
-  get/confirm/cancel endpoints; I rewrote it into one `reservationOp` helper
+  get/confirm/cancel endpoints. I rewrote it as one `reservationOp` helper
   that takes the operation as a function.
-- Timestamps were returned in the server's local timezone (`+05:00`). I
-  noticed this while testing with curl against the running service, and
-  added UTC normalization at the store boundary plus a test assertion for
-  it.
-- Ports and connection URLs changed twice, because the generated defaults
-  conflicted with services already running on my machine (5432, then 5433).
-  The compose file now maps PostgreSQL to 5434.
+- Timestamps came back in local time (`+05:00`). I found it while testing
+  with curl and added UTC conversion in the store layer plus a test for it.
+- Ports changed twice because 5432 and 5433 were busy on my machine; the
+  compose file now uses 5434.
 
 ## 5. How did you verify that generated code was correct?
 
-- The integration tests run every required behavior against a real
-  PostgreSQL, including a test with 10 goroutines that fails if even one
-  unit of stock is oversold. The suite is run with `-race`.
-- `go vet` on the whole module.
-- A manual curl session against the running server: happy path, idempotent
-  replay (201 → 200 with the same reservation id), confirm with stock
-  deduction, oversell rejection with the shortage list, and 404 mapping.
-  This is how I found the UTC timezone bug above.
-- I read the transaction code myself and checked the locking logic: every
-  write that affects availability takes the stock row locks in sorted
-  product order, so competing reservations line up and multi-item
-  reservations can't deadlock.
+- Integration tests on a real PostgreSQL, including a test with 10
+  goroutines that fails if even one unit is oversold. Run with `-race`.
+- `go vet` on the module.
+- Manual curl testing: create, replay with the same key (201 → 200, same
+  id), confirm with stock deduction, oversell error, 404s. That's how I
+  found the timezone bug.
+- I read the transaction code myself and checked that every write takes
+  the stock locks in the same sorted order.
